@@ -662,23 +662,57 @@ class PdfFileWriter(object):
 
             pageRef.__setitem__(NameObject('/Contents'), content)
 
-    def addLink(self, pagenum, pagedest, rect, zoom='/FitV'):
+    def addLink(self, pagenum, pagedest, rect, zoom='/FitV', border=None):
+        """Add an internal link from a rectangular area to the specified page.
+
+        pagenum: integer index of the page on which to place the link.
+        pagedest: integer index of the page to which the link should go.
+        rect: RectangleObject or array of four integers specifying the clickable
+            rectangular area [xLL, yLL, xUR, yUR], or string in the form 
+            "[ xLL yLL xUR yUR ]".
+        zoom: string representation of a zoom option.
+        border: if provided, an array describing border-drawing properties. See 
+            the PDF spec for details. No border will be drawn if this argument 
+            is omitted.
+
+        Valid zoom arguments (see PDF spec for details):
+            /Fit
+            /XYZ [left] [top] [zoomFactor]
+            /FitH [top]
+            /FitV [left]
+            /FitR left bottom right top
+            /FitB
+            /FitBH [top]
+            /FitBV [left]
         """
-        Add a internal link in pdf, from a rectangular area and pointing at
-        the specified page number.
-        """
+
         pageLink = self.getObject(self._pages)['/Kids'][pagenum]
         pageDest = self.getObject(self._pages)['/Kids'][pagedest] #TODO: switch for external link
         pageRef = self.getObject(pageLink)
 
+        if border is not None:
+            borderArr = [NameObject(n) for n in border[:3]]
+            if len(border) == 4:
+                dashPattern = ArrayObject([NameObject(n) for n in border[3]])
+                borderArr.append(dashPattern)
+        else:
+            borderArr = [NumberObject(0)] * 3
+            
+        if isinstance(rect, Str):
+            rect = NameObject(rect)
+        elif isinstance(rect, RectangleObject):
+            pass
+        else:
+            rect = RectangleObject(rect)
+
         lnk = DictionaryObject()
         lnk.update({
-            NameObject('/Rect'): NameObject(rect), # link pposition
-            NameObject('/Dest'): ArrayObject([pageDest, NameObject(zoom), NumberObject(826)]), 
-            NameObject('/P'): NameObject(pageLink), # 1pt border
-            NameObject('/Border'): NameObject('[ 0 0 0 ]'), # [0 0 1] 1pt border
             NameObject('/Type'): NameObject('/Annot'),
             NameObject('/Subtype'): NameObject('/Link'),
+            NameObject('/P'): pageLink,
+            NameObject('/Rect'): rect,
+            NameObject('/Border'): ArrayObject(borderArr),
+            NameObject('/Dest'): ArrayObject([pageDest, NameObject(zoom)])
         })
         lnkRef = self._addObject(lnk)
 
@@ -790,7 +824,7 @@ class PdfFileReader(object):
         self.xrefIndex = 0
         if hasattr(stream, 'mode') and 'b' not in stream.mode:
             warnings.warn("PdfFileReader stream/file object is not in binary mode. It may not be read correctly.", utils.PdfReadWarning)
-        if type(stream) == string_type:
+        if type(stream) in (string_type, str):
             fileobj = open(stream, 'rb')
             stream = BytesIO(b_(fileobj.read()))
             fileobj.close()
@@ -1125,7 +1159,7 @@ class PdfFileReader(object):
                 # Adobe Reader doesn't complain, so continue (in strict mode?)
                 e = sys.exc_info()[1]
                 warnings.warn("Invalid stream (index %d) within object %d %d: %s" % \
-                      (i, indirectReference.idnum, indirectReference.generation, e.message), utils.PdfReadWarning)
+                      (i, indirectReference.idnum, indirectReference.generation, e), utils.PdfReadWarning)
 
                 if self.strict: 
                     raise utils.PdfReadError("Can't read object stream: %s"%e)
@@ -1255,10 +1289,18 @@ class PdfFileReader(object):
 
         # find startxref entry - the location of the xref table
         line = self.readNextEndLine(stream)
-        startxref = int(line)
-        line = self.readNextEndLine(stream)
-        if line[:9] != b_("startxref"):
-            raise utils.PdfReadError("startxref not found")
+        try:
+            startxref = int(line)
+        except ValueError:
+            # 'startxref' may be on the same line as the location
+            if not line.startswith("startxref"):
+                raise utils.PdfReadError("startxref not found")
+            startxref = int(line[9:].strip())
+            warnings.warn("startxref on same line as offset")
+        else:
+            line = self.readNextEndLine(stream)
+            if line[:9] != b_("startxref"):
+                raise utils.PdfReadError("startxref not found")
 
         # read all cross reference tables and their trailers
         self.xref = {}
@@ -1433,10 +1475,20 @@ class PdfFileReader(object):
                 if xref_loc != -1:
                     startxref -= (10 - xref_loc)
                     continue
-                else:
-                    # no xref table found at specified location
-                    assert False
-                    break
+                # No explicit xref table, try finding a cross-reference stream.
+                stream.seek(startxref, 0)
+                found = False
+                for look in range(5):
+                    if stream.read(1).isdigit():
+                        # This is not a standard PDF, consider adding a warning
+                        startxref += look
+                        found = True
+                        break
+                if found:
+                    continue
+                # no xref table found at specified location
+                assert False
+                break
         #if not zero-indexed, verify that the table is correct; change it if necessary
         if self.xrefIndex and not self.strict:
             loc = stream.tell()
@@ -2041,7 +2093,7 @@ class PageObject(DictionaryObject):
         sx = width / float(self.mediaBox.getUpperRight_x() -
                       self.mediaBox.getLowerLeft_x ())
         sy = height / float(self.mediaBox.getUpperRight_y() -
-                       self.mediaBox.getLowerLeft_x ())
+                       self.mediaBox.getLowerLeft_y ())
         self.scale(sx, sy)
 
     ##
@@ -2164,7 +2216,7 @@ class ContentStream(DecodedStreamObject):
         operands = []
         while True:
             peek = readNonWhitespace(stream)
-            if peek == b_(''):
+            if peek == b_('') or ord_(peek) == 0:
                 break
             stream.seek(-1, 1)
             if peek.isalpha() or peek == "'" or peek == '"':
@@ -2174,7 +2226,7 @@ class ContentStream(DecodedStreamObject):
                     if tok.isspace() or tok in NameObject.delimiterCharacters:
                         stream.seek(-1, 1)
                         break
-                    elif tok == '':
+                    elif tok == b_(''):
                         break
                     operator += tok
                 if operator == "BI":
@@ -2326,7 +2378,18 @@ class DocumentInformation(DictionaryObject):
     # @return A unicode string, or None if the producer is not provided.
     producer = property(lambda self: self.getText("/Producer"))
     producer_raw = property(lambda self: self.get("/Producer"))
-
+    
+    ##
+    # Read-only property accessing the document's creation date.
+    # @return A unicode string, or None if the creation date is not provided.
+    creationDate = property(lambda self: self.getText("/CreationDate"))
+    creationDate_raw = property(lambda self: self.get("/CreationDate"))
+    
+    ##
+    # Read-only property accessing the date the document was last modified.
+    # @return A unicode string, or None if the modification date is not provided.
+    modDate = property(lambda self: self.getText("/ModDate"))
+    modDate_raw = property(lambda self: self.get("/ModDate"))
 
 def convertToInt(d, size):
     if size > 8:
@@ -2483,3 +2546,29 @@ def _alg35(password, rev, keylen, owner_entry, p_entry, id1_entry, metadata_encr
     # mean, so I have used null bytes.  This seems to match a few other
     # people's implementations)
     return val + (b_('\x00') * 16), key
+
+##
+# This method checks if the file given as input is a valid pdf file.
+#
+# @param filename is the name of the file the user inserts 
+# when the isPdfValid method is called.
+#
+def isPdfValid(filename):
+
+    print ("\nFile given as input: " + filename + ".")
+
+    inputFile = open(filename, "rb")
+
+    byte1 = inputFile.read(1)
+    byte2 = inputFile.read(2)
+    byte3 = inputFile.read(3)
+    byte4 = inputFile.read(4)
+    byte5 = inputFile.read(5)
+
+    if byte1=='%' and byte2=='PD' and byte3.startswith('F'):
+        print "This file is a valid pdf."
+        if not filename.endswith('.pdf'):
+            print "You should append '.pdf' suffix at the end of the file name"
+    else:
+        print "This file is not a valid pdf."
+
